@@ -1,0 +1,121 @@
+# UTS TK122 - Cold Storage UMKM. Jalankan:  docker compose up -d --build
+name: uts-tk122
+x-common: &common
+  restart: unless-stopped
+  networks: [iot]
+
+services:
+  # ---------------- Layer Edge / Network ----------------
+  mosquitto:                      # broker MQTT di lokasi (site broker)
+    <<: *common
+    image: eclipse-mosquitto:2.0
+    ports: ["1883:1883"]
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosq-data:/mosquitto/data
+
+  simulator:                      # 3 perangkat ESP32 virtual, publish tiap 10 detik
+    <<: *common
+    build: ./simulator
+    environment:
+      NIM: ${NIM:-24831094}
+      MQTT_HOST: mosquitto
+      N_DEVICES: 3
+      INTERVAL_S: 10
+      FAULT_AFTER_S: ${FAULT_AFTER_S:-0}
+      FAULT_DURATION_S: ${FAULT_DURATION_S:-400}
+    depends_on: [mosquitto]
+
+  edge:                           # agregasi 1 menit, threshold lokal, store & forward, gateway ThingsBoard
+    <<: *common
+    build: ./edge
+    environment:
+      NIM: ${NIM:-24831094}
+      N_DEVICES: 3
+      MQTT_HOST: mosquitto
+      TB_HOST: thingsboard
+      TB_PORT: 1883
+      TB_GATEWAY_TOKEN: ${TB_GATEWAY_TOKEN:-}
+    volumes: [edge-data:/data]
+    depends_on: [mosquitto]
+
+  # ---------------- Layer Platform ----------------
+  thingsboard:                    # ThingsBoard CE self-hosted (UI http://localhost:8080)
+    <<: *common
+    image: thingsboard/tb-postgres:3.9.1
+    ports:
+      - "8080:9090"               # UI
+      - "1884:1883"               # MQTT device API (1883 host dipakai Mosquitto)
+    environment:
+      TB_QUEUE_TYPE: in-memory
+    volumes:
+      - tb-data:/data
+      - tb-logs:/var/log/thingsboard
+
+  kafka:                          # Apache Kafka KRaft single node
+    <<: *common
+    image: apache/kafka:3.8.1
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+    volumes: [kafka-data:/var/lib/kafka/data]
+
+  kafka-init:                     # membuat topic dengan 3 partisi
+    image: apache/kafka:3.8.1
+    networks: [iot]
+    depends_on:
+      kafka: {condition: service_healthy}
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for t in coldstore.telemetry coldstore.agg1m; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic $$t --partitions 3 --replication-factor 1
+        done
+
+  kafka-bridge:                   # MQTT -> Kafka
+    <<: *common
+    build: ./kafka-bridge
+    environment: {NIM: "${NIM:-24831094}", MQTT_HOST: mosquitto, KAFKA_BOOTSTRAP: "kafka:9092"}
+    depends_on:
+      mosquitto: {condition: service_started}
+      kafka-init: {condition: service_completed_successfully}
+
+  # ---------------- Layer Application: consumer group (2 consumer) ----------------
+  consumer-1:
+    <<: *common
+    build: ./consumer
+    environment: {CONSUMER_NAME: consumer-1, KAFKA_BOOTSTRAP: "kafka:9092"}
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+  consumer-2:
+    <<: *common
+    build: ./consumer
+    environment: {CONSUMER_NAME: consumer-2, KAFKA_BOOTSTRAP: "kafka:9092"}
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+
+networks:
+  iot: {}
+volumes:
+  mosq-data: {}
+  edge-data: {}
+  tb-data: {}
+  tb-logs: {}
+  kafka-data: {}
